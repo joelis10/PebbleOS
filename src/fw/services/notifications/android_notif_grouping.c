@@ -12,9 +12,9 @@
 #include "system/logging.h"
 #include "system/passert.h"
 #include "util/size.h"
-#include "util/stringlist.h"
 #include "util/uuid.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -34,9 +34,11 @@
 //! Max bytes used for a single message body (including null terminator)
 #define CONV_BODY_MAX 201
 
-// Total allocation sizes for each StringList
-#define HEADINGS_BUF_SIZE (sizeof(StringList) + CONV_MAX_MESSAGES * CONV_SENDER_MAX + 1)
-#define PARAGRAPHS_BUF_SIZE (sizeof(StringList) + CONV_MAX_MESSAGES * CONV_BODY_MAX + 1)
+//! Max bytes for one "Sender: body\n" line
+#define CONV_LINE_MAX (CONV_SENDER_MAX + 2 + CONV_BODY_MAX)
+
+//! Total body buffer: enough for all messages plus a null terminator
+#define CONV_BODY_BUF_SIZE (CONV_MAX_MESSAGES * CONV_LINE_MAX + 1)
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,57 +140,135 @@ bool android_notif_try_group(TimelineItem *notif) {
     sender = title;
   }
 
-  const uint32_t key   = prv_conv_key(title, appname);
-  ConvEntry *entry     = prv_find_entry(key);
+  // In group chats the title is the group name; in 1-to-1 chats sender == title.
+  // Only prefix lines with "Sender: " in group chats to avoid redundancy.
+  const bool is_group = (strcmp(sender, title) != 0);
+
+  const uint32_t key = prv_conv_key(title, appname);
+  ConvEntry *entry   = prv_find_entry(key);
 
   // -------------------------------------------------------------------------
-  // Allocate StringList buffers (heap – can be large for the stack)
+  // Allocate the body text buffer (heap)
   // -------------------------------------------------------------------------
-  StringList *headings   = kernel_zalloc_check(HEADINGS_BUF_SIZE);
-  StringList *paragraphs = kernel_zalloc_check(PARAGRAPHS_BUF_SIZE);
-  if (!headings || !paragraphs) {
-    PBL_LOG_WRN("android_notif_grouping: OOM building StringLists");
-    kernel_free(headings);
-    kernel_free(paragraphs);
+  char *body_buf = kernel_zalloc_check(CONV_BODY_BUF_SIZE);
+  if (!body_buf) {
+    PBL_LOG_WRN("android_notif_grouping: OOM");
     return false;
   }
 
   // -------------------------------------------------------------------------
-  // Load existing messages if we already have a conversation entry
+  // Build the body string
+  // Each message is one line: "body" (1-to-1) or "Sender: body" (group).
   // -------------------------------------------------------------------------
   bool updating = false;
-  if (entry) {
-    TimelineItem existing = {};
-    notification_storage_lock();
-    bool loaded = notification_storage_get(&entry->notif_id, &existing);
-    notification_storage_unlock();
 
-    if (loaded) {
-      updating = true;
-      StringList *ex_h = attribute_get_string_list(&existing.attr_list, AttributeIdHeadings);
-      StringList *ex_p = attribute_get_string_list(&existing.attr_list, AttributeIdParagraphs);
-      // Keep the last (CONV_MAX_MESSAGES - 1) existing messages to leave room for the new one
-      const size_t existing_count = string_list_count(ex_h);
-      const size_t start = (existing_count >= CONV_MAX_MESSAGES)
-                           ? (existing_count - (CONV_MAX_MESSAGES - 1)) : 0;
-      // Copy [start, existing_count) entries into our buffers
-      for (size_t i = start; i < existing_count; i++) {
-        const char *h = string_list_get_at(ex_h, i);
-        const char *p = string_list_get_at(ex_p, i);
-        if (h) string_list_add_string(headings,   HEADINGS_BUF_SIZE,   h, CONV_SENDER_MAX - 1);
-        if (p) string_list_add_string(paragraphs, PARAGRAPHS_BUF_SIZE, p, CONV_BODY_MAX   - 1);
+  // If Android embedded the full current message list (MessagingStyle), use it
+  // as the authoritative source so dismissed-on-phone messages don't linger.
+  StringList *in_h = attribute_get_string_list(attrs, AttributeIdHeadings);
+  StringList *in_p = attribute_get_string_list(attrs, AttributeIdParagraphs);
+  const size_t in_count = in_h ? string_list_count(in_h) : 0;
+
+  if (in_count > 0) {
+    // Rebuild body from the phone's authoritative list.
+    for (size_t i = 0; i < in_count; i++) {
+      const char *h = string_list_get_at(in_h, i);
+      const char *p = string_list_get_at(in_p, i);
+      if (!h || !p) {
+        continue;
       }
-      timeline_item_free_allocated_buffer(&existing);
-    } else {
-      // Cached entry points to a notification that no longer exists – treat as new
-      PBL_LOG_DBG("android_notif_grouping: cached entry not in storage, restarting");
-      updating = false;
+      const size_t cur_len = strlen(body_buf);
+      const size_t remaining = CONV_BODY_BUF_SIZE - cur_len - 1;
+      if (remaining == 0) {
+        break;
+      }
+      const char *sep = (cur_len > 0) ? "\n" : "";
+      if (strcmp(h, title) != 0) {
+        snprintf(body_buf + cur_len, remaining, "%s%s: %s", sep, h, p);
+      } else {
+        snprintf(body_buf + cur_len, remaining, "%s%s", sep, p);
+      }
+    }
+    // Dedup: if the resulting body matches what is already stored, suppress.
+    updating = (entry != NULL);
+    if (updating) {
+      TimelineItem existing = {};
+      notification_storage_lock();
+      bool loaded = notification_storage_get(&entry->notif_id, &existing);
+      notification_storage_unlock();
+      if (loaded) {
+        const char *stored = attribute_get_string(&existing.attr_list, AttributeIdBody, "");
+        const bool is_dup = (strcmp(body_buf, stored) == 0);
+        timeline_item_free_allocated_buffer(&existing);
+        if (is_dup) {
+          kernel_free(body_buf);
+          return true;
+        }
+      } else {
+        updating = false;
+      }
+    }
+  } else {
+    // No list from Android — accumulate from our stored history + new message.
+    if (entry) {
+      TimelineItem existing = {};
+      notification_storage_lock();
+      bool loaded = notification_storage_get(&entry->notif_id, &existing);
+      notification_storage_unlock();
+      if (loaded) {
+        updating = true;
+        const char *stored = attribute_get_string(&existing.attr_list, AttributeIdBody, NULL);
+        if (stored) {
+          // Copy stored body, dropping the oldest lines if at the message limit.
+          const char *copy_from = stored;
+          size_t line_count = 0;
+          for (const char *p = stored; *p; p++) {
+            if (*p == '\n') {
+              line_count++;
+            }
+          }
+          while (line_count >= CONV_MAX_MESSAGES) {
+            const char *nl = strchr(copy_from, '\n');
+            if (!nl) {
+              break;
+            }
+            copy_from = nl + 1;
+            line_count--;
+          }
+          strncpy(body_buf, copy_from, CONV_BODY_BUF_SIZE - 1);
+        }
+        timeline_item_free_allocated_buffer(&existing);
+      } else {
+        PBL_LOG_DBG("android_notif_grouping: cached entry not in storage, restarting");
+      }
+    }
+
+    // Dedup: suppress if the last stored line matches the incoming message.
+    {
+      const char *last_line = body_buf[0] ? body_buf : NULL;
+      for (const char *p = body_buf; *p; p++) {
+        if (*p == '\n' && *(p + 1)) {
+          last_line = p + 1;
+        }
+      }
+      char new_line[CONV_LINE_MAX + 1];
+      if (is_group) {
+        snprintf(new_line, sizeof(new_line), "%s: %s", sender, body);
+      } else {
+        snprintf(new_line, sizeof(new_line), "%s", body);
+      }
+      if (last_line && strcmp(last_line, new_line) == 0) {
+        kernel_free(body_buf);
+        return true;
+      }
+      // Append the new line.
+      const size_t cur_len = strlen(body_buf);
+      const size_t remaining = CONV_BODY_BUF_SIZE - cur_len - 1;
+      if (remaining > 0) {
+        const char *sep = (cur_len > 0) ? "\n" : "";
+        snprintf(body_buf + cur_len, remaining, "%s%s", sep, new_line);
+      }
     }
   }
-
-  // Append the new message
-  string_list_add_string(headings,   HEADINGS_BUF_SIZE,   sender, CONV_SENDER_MAX - 1);
-  string_list_add_string(paragraphs, PARAGRAPHS_BUF_SIZE, body,   CONV_BODY_MAX   - 1);
 
   // -------------------------------------------------------------------------
   // Build the merged notification attributes
@@ -198,12 +278,9 @@ bool android_notif_try_group(TimelineItem *notif) {
   if (appname) {
     attribute_list_add_cstring(&new_attrs, AttributeIdAppName, appname);
   }
-  // Keep latest message in body so the peek / banner still shows something useful
-  attribute_list_add_cstring(&new_attrs, AttributeIdBody, body);
-  attribute_list_add_string_list(&new_attrs, AttributeIdHeadings,   headings);
-  attribute_list_add_string_list(&new_attrs, AttributeIdParagraphs, paragraphs);
+  attribute_list_add_cstring(&new_attrs, AttributeIdBody, body_buf);
 
-  // Preserve visual attributes from the incoming notification
+  // Preserve visual attributes from the incoming notification.
   const AttributeId preserve[] = {
     AttributeIdIconTiny, AttributeIdIconSmall, AttributeIdIconLarge, AttributeIdIconPin,
     AttributeIdBgColor,  AttributeIdPrimaryColor, AttributeIdSecondaryColor,
@@ -231,8 +308,7 @@ bool android_notif_try_group(TimelineItem *notif) {
       &new_attrs, &notif->action_group);
 
   attribute_list_destroy_list(&new_attrs);
-  kernel_free(headings);
-  kernel_free(paragraphs);
+  kernel_free(body_buf);
 
   if (!merged) {
     PBL_LOG_WRN("android_notif_grouping: failed to create merged item");
@@ -262,6 +338,11 @@ bool android_notif_try_group(TimelineItem *notif) {
 
   Uuid *event_id = kernel_malloc_check(sizeof(Uuid));
   *event_id = conv_uuid;
+  // When replacing an existing entry, remove the old display entry first so the
+  // notification list doesn't show both the stale and updated versions.
+  if (updating) {
+    notifications_handle_notification_removed(event_id);
+  }
   notifications_handle_notification_added(event_id);
 
   return true;
