@@ -4,10 +4,12 @@
 #include "pbl/services/blob_db/notif_db.h"
 
 #include "kernel/pbl_malloc.h"
+#include "pbl/services/notifications/android_notif_grouping.h"
 #include "pbl/services/notifications/notification_storage.h"
 #include "system/logging.h"
 
 void notif_db_init(void) {
+  android_notif_grouping_init();
 }
 
 status_t notif_db_insert(const uint8_t *key, int key_len, const uint8_t *val, int val_len) {
@@ -41,9 +43,15 @@ status_t notif_db_insert(const uint8_t *key, int key_len, const uint8_t *val, in
     PBL_LOG_INFO("Notification modified: %s", uuid_string);
     notifications_handle_notification_acted_upon(id);
   } else if (!has_status_bits) {
-    notification_storage_store(&notification);
-    PBL_LOG_INFO("Notification added: %s", uuid_string);
-    notifications_handle_notification_added(id);
+    if (android_notif_try_group(&notification)) {
+      // Grouping module has handled storage and fired the notification event
+      PBL_LOG_INFO("Notification grouped: %s", uuid_string);
+      kernel_free(id);
+    } else {
+      notification_storage_store(&notification);
+      PBL_LOG_INFO("Notification added: %s", uuid_string);
+      notifications_handle_notification_added(id);
+    }
   }
 
   timeline_item_free_allocated_buffer(&notification);

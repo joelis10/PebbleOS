@@ -5,6 +5,7 @@ sources = [
     'action_chaining_window.c',
     'alerts.c',
     'alerts_preferences.c',
+    'android_notif_grouping.c',
     'ancs/ancs_filtering.c',
     'ancs/ancs_item.c',
     'ancs/ancs_notifications.c',

@@ -4,6 +4,7 @@
 #include "pbl/services/timeline/layout_node.h"
 
 #include "pbl/services/timeline/timeline_layout.h"
+#include "applib/graphics/gcolor_definitions.h"
 #include "kernel/pbl_malloc.h"
 #include "pbl/services/i18n/i18n.h"
 #include "system/passert.h"
@@ -235,8 +236,24 @@ GTextNodeVertical *layout_create_headings_paragraphs_node(
     .extent.margin.h = 17,
   };
 
+#if PBL_COLOR
+  // Palette of distinct colours assigned to senders so each person in a
+  // conversation is visually distinguishable.  Chosen to be readable on both
+  // the default light-grey notification background and common dark backgrounds.
+  static const uint8_t s_sender_colors[] = {
+    GColorCobaltBlueARGB8,   // #0055AA
+    GColorJaegerGreenARGB8,  // #00AA55
+    GColorFollyARGB8,        // #FF0055
+    GColorPurpureusARGB8,    // #AA55AA
+    GColorTiffanyBlueARGB8,  // #00AAAA
+    GColorChromeYellowARGB8, // #FFAA00
+  };
+  const size_t num_sender_colors = ARRAY_LENGTH(s_sender_colors);
+#endif
+
   GTextNodeVertical *vertical_node = graphics_text_node_create_vertical(num_headings * 2);
 
+  const char *prev_heading = NULL;
   for (unsigned int i = 0; i < num_headings; i++) {
     const char *heading = string_list_get_at(headings, i);
     const char *paragraph = string_list_get_at(paragraphs, i);
@@ -244,15 +261,35 @@ GTextNodeVertical *layout_create_headings_paragraphs_node(
       break;
     }
 
-    GTextNodeText *heading_node =
-        (GTextNodeText *)layout_create_text_node_from_config(
-            layout, &s_heading_config.extent.node);
+    // Only show the sender name when it changes — consecutive messages from
+    // the same person don't need it repeated.
+    const bool same_sender = prev_heading && (strcmp(heading, prev_heading) == 0);
+    prev_heading = heading;
+
+    if (!same_sender) {
+      GTextNodeText *heading_node =
+          (GTextNodeText *)layout_create_text_node_from_config(
+              layout, &s_heading_config.extent.node);
+      heading_node->text = (char *)heading;
+
+#if PBL_COLOR
+      // Derive a stable colour for this sender from their name so the same
+      // person always appears in the same colour within this conversation.
+      uint32_t name_hash = 0x811c9dc5u;
+      for (const char *c = heading; *c; c++) {
+        name_hash ^= (uint8_t)(*c);
+        name_hash *= 0x01000193u;
+      }
+      heading_node->color = (GColor){ .argb = s_sender_colors[name_hash % num_sender_colors] };
+#endif
+
+      graphics_text_node_container_add_child(&vertical_node->container, &heading_node->node);
+    }
+
     GTextNodeText *paragraph_node =
         (GTextNodeText *)layout_create_text_node_from_config(
             layout, &s_paragraph_config.extent.node);
-    heading_node->text = (char *)heading;
     paragraph_node->text = (char *)paragraph;
-    graphics_text_node_container_add_child(&vertical_node->container, &heading_node->node);
     graphics_text_node_container_add_child(&vertical_node->container, &paragraph_node->node);
   }
 
