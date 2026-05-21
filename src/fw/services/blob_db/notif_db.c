@@ -76,8 +76,16 @@ status_t notif_db_delete(const uint8_t *key, int key_len) {
     return E_INVALID_ARGUMENT;
   }
 
-  notification_storage_remove((Uuid *)key);
-  notifications_handle_notification_removed((Uuid *)key);
+  Uuid *id = (Uuid *)key;
+
+  // If this UUID was a grouped message, the grouping module removes the whole
+  // conversation and fires the removed event itself.
+  if (android_notif_grouping_handle_delete(id)) {
+    return S_SUCCESS;
+  }
+
+  notification_storage_remove(id);
+  notifications_handle_notification_removed(id);
 
   return S_SUCCESS;
 }

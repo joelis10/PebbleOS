@@ -49,12 +49,25 @@ typedef struct {
   Uuid     notif_id; //!< UUID of the stored conversation notification
 } ConvEntry;
 
+//! Max individual message UUIDs to track for delete-forwarding
+#define MSG_MAP_SIZE 32
+
+//! Maps an individual message UUID → the conversation UUID it was merged into.
+//! Used to forward phone-side dismissals to the correct grouped notification.
+typedef struct {
+  Uuid msg_uuid;
+  Uuid conv_uuid;
+} MsgMapEntry;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-static ConvEntry s_conv_cache[CONV_CACHE_SIZE];
-static uint8_t   s_conv_count;
+static ConvEntry  s_conv_cache[CONV_CACHE_SIZE];
+static uint8_t    s_conv_count;
+
+static MsgMapEntry s_msg_map[MSG_MAP_SIZE];
+static uint8_t     s_msg_map_count;
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -115,9 +128,30 @@ static ConvEntry *prv_upsert_entry(uint32_t key, const Uuid *notif_id) {
 // Public API
 // ---------------------------------------------------------------------------
 
+//! Remove a conversation (and all its msg_map entries) from our caches.
+static void prv_remove_conv_from_cache(const Uuid *conv_uuid) {
+  for (int i = 0; i < s_conv_count; i++) {
+    if (uuid_equal(&s_conv_cache[i].notif_id, conv_uuid)) {
+      memmove(&s_conv_cache[i], &s_conv_cache[i + 1],
+              (s_conv_count - i - 1) * sizeof(ConvEntry));
+      s_conv_count--;
+      break;
+    }
+  }
+  for (int i = s_msg_map_count - 1; i >= 0; i--) {
+    if (uuid_equal(&s_msg_map[i].conv_uuid, conv_uuid)) {
+      memmove(&s_msg_map[i], &s_msg_map[i + 1],
+              (s_msg_map_count - i - 1) * sizeof(MsgMapEntry));
+      s_msg_map_count--;
+    }
+  }
+}
+
 void android_notif_grouping_init(void) {
   memset(s_conv_cache, 0, sizeof(s_conv_cache));
   s_conv_count = 0;
+  memset(s_msg_map, 0, sizeof(s_msg_map));
+  s_msg_map_count = 0;
 }
 
 bool android_notif_try_group(TimelineItem *notif) {
@@ -159,114 +193,67 @@ bool android_notif_try_group(TimelineItem *notif) {
   // -------------------------------------------------------------------------
   // Build the body string
   // Each message is one line: "body" (1-to-1) or "Sender: body" (group).
+  // Accumulate from stored history + new message.
   // -------------------------------------------------------------------------
   bool updating = false;
 
-  // If Android embedded the full current message list (MessagingStyle), use it
-  // as the authoritative source so dismissed-on-phone messages don't linger.
-  StringList *in_h = attribute_get_string_list(attrs, AttributeIdHeadings);
-  StringList *in_p = attribute_get_string_list(attrs, AttributeIdParagraphs);
-  const size_t in_count = in_h ? string_list_count(in_h) : 0;
+  if (entry) {
+    TimelineItem existing = {};
+    notification_storage_lock();
+    bool loaded = notification_storage_get(&entry->notif_id, &existing);
+    notification_storage_unlock();
+    if (loaded) {
+      updating = true;
+      const char *stored = attribute_get_string(&existing.attr_list, AttributeIdBody, NULL);
+      if (stored) {
+        // Copy stored body, dropping the oldest lines if at the message limit.
+        const char *copy_from = stored;
+        size_t line_count = 0;
+        for (const char *p = stored; *p; p++) {
+          if (*p == '\n') {
+            line_count++;
+          }
+        }
+        while (line_count >= CONV_MAX_MESSAGES) {
+          const char *nl = strchr(copy_from, '\n');
+          if (!nl) {
+            break;
+          }
+          copy_from = nl + 1;
+          line_count--;
+        }
+        strncpy(body_buf, copy_from, CONV_BODY_BUF_SIZE - 1);
+      }
+      timeline_item_free_allocated_buffer(&existing);
+    } else {
+      PBL_LOG_DBG("android_notif_grouping: cached entry not in storage, restarting");
+    }
+  }
 
-  if (in_count > 0) {
-    // Rebuild body from the phone's authoritative list.
-    for (size_t i = 0; i < in_count; i++) {
-      const char *h = string_list_get_at(in_h, i);
-      const char *p = string_list_get_at(in_p, i);
-      if (!h || !p) {
-        continue;
+  // Dedup: suppress if the last stored line matches the incoming message.
+  {
+    const char *last_line = body_buf[0] ? body_buf : NULL;
+    for (const char *p = body_buf; *p; p++) {
+      if (*p == '\n' && *(p + 1)) {
+        last_line = p + 1;
       }
-      const size_t cur_len = strlen(body_buf);
-      const size_t remaining = CONV_BODY_BUF_SIZE - cur_len - 1;
-      if (remaining == 0) {
-        break;
-      }
+    }
+    char new_line[CONV_LINE_MAX + 1];
+    if (is_group) {
+      snprintf(new_line, sizeof(new_line), "%s: %s", sender, body);
+    } else {
+      snprintf(new_line, sizeof(new_line), "%s", body);
+    }
+    if (last_line && strcmp(last_line, new_line) == 0) {
+      kernel_free(body_buf);
+      return true;
+    }
+    // Append the new line.
+    const size_t cur_len = strlen(body_buf);
+    const size_t remaining = CONV_BODY_BUF_SIZE - cur_len - 1;
+    if (remaining > 0) {
       const char *sep = (cur_len > 0) ? "\n" : "";
-      if (strcmp(h, title) != 0) {
-        snprintf(body_buf + cur_len, remaining, "%s%s: %s", sep, h, p);
-      } else {
-        snprintf(body_buf + cur_len, remaining, "%s%s", sep, p);
-      }
-    }
-    // Dedup: if the resulting body matches what is already stored, suppress.
-    updating = (entry != NULL);
-    if (updating) {
-      TimelineItem existing = {};
-      notification_storage_lock();
-      bool loaded = notification_storage_get(&entry->notif_id, &existing);
-      notification_storage_unlock();
-      if (loaded) {
-        const char *stored = attribute_get_string(&existing.attr_list, AttributeIdBody, "");
-        const bool is_dup = (strcmp(body_buf, stored) == 0);
-        timeline_item_free_allocated_buffer(&existing);
-        if (is_dup) {
-          kernel_free(body_buf);
-          return true;
-        }
-      } else {
-        updating = false;
-      }
-    }
-  } else {
-    // No list from Android — accumulate from our stored history + new message.
-    if (entry) {
-      TimelineItem existing = {};
-      notification_storage_lock();
-      bool loaded = notification_storage_get(&entry->notif_id, &existing);
-      notification_storage_unlock();
-      if (loaded) {
-        updating = true;
-        const char *stored = attribute_get_string(&existing.attr_list, AttributeIdBody, NULL);
-        if (stored) {
-          // Copy stored body, dropping the oldest lines if at the message limit.
-          const char *copy_from = stored;
-          size_t line_count = 0;
-          for (const char *p = stored; *p; p++) {
-            if (*p == '\n') {
-              line_count++;
-            }
-          }
-          while (line_count >= CONV_MAX_MESSAGES) {
-            const char *nl = strchr(copy_from, '\n');
-            if (!nl) {
-              break;
-            }
-            copy_from = nl + 1;
-            line_count--;
-          }
-          strncpy(body_buf, copy_from, CONV_BODY_BUF_SIZE - 1);
-        }
-        timeline_item_free_allocated_buffer(&existing);
-      } else {
-        PBL_LOG_DBG("android_notif_grouping: cached entry not in storage, restarting");
-      }
-    }
-
-    // Dedup: suppress if the last stored line matches the incoming message.
-    {
-      const char *last_line = body_buf[0] ? body_buf : NULL;
-      for (const char *p = body_buf; *p; p++) {
-        if (*p == '\n' && *(p + 1)) {
-          last_line = p + 1;
-        }
-      }
-      char new_line[CONV_LINE_MAX + 1];
-      if (is_group) {
-        snprintf(new_line, sizeof(new_line), "%s: %s", sender, body);
-      } else {
-        snprintf(new_line, sizeof(new_line), "%s", body);
-      }
-      if (last_line && strcmp(last_line, new_line) == 0) {
-        kernel_free(body_buf);
-        return true;
-      }
-      // Append the new line.
-      const size_t cur_len = strlen(body_buf);
-      const size_t remaining = CONV_BODY_BUF_SIZE - cur_len - 1;
-      if (remaining > 0) {
-        const char *sep = (cur_len > 0) ? "\n" : "";
-        snprintf(body_buf + cur_len, remaining, "%s%s", sep, new_line);
-      }
+      snprintf(body_buf + cur_len, remaining, "%s%s", sep, new_line);
     }
   }
 
@@ -336,6 +323,21 @@ bool android_notif_try_group(TimelineItem *notif) {
   // -------------------------------------------------------------------------
   prv_upsert_entry(key, &conv_uuid);
 
+  // Track msg_uuid → conv_uuid so that a phone-side dismiss of this individual
+  // message UUID correctly tears down the whole grouped conversation.
+  if (updating && !uuid_equal(&notif->header.id, &conv_uuid)) {
+    MsgMapEntry *m;
+    if (s_msg_map_count < MSG_MAP_SIZE) {
+      m = &s_msg_map[s_msg_map_count++];
+    } else {
+      memmove(&s_msg_map[0], &s_msg_map[1],
+              (MSG_MAP_SIZE - 1) * sizeof(MsgMapEntry));
+      m = &s_msg_map[MSG_MAP_SIZE - 1];
+    }
+    m->msg_uuid  = notif->header.id;
+    m->conv_uuid = conv_uuid;
+  }
+
   Uuid *event_id = kernel_malloc_check(sizeof(Uuid));
   *event_id = conv_uuid;
   // When replacing an existing entry, remove the old display entry first so the
@@ -346,4 +348,36 @@ bool android_notif_try_group(TimelineItem *notif) {
   notifications_handle_notification_added(event_id);
 
   return true;
+}
+
+bool android_notif_grouping_handle_delete(const Uuid *id) {
+  // Case 1: id directly matches a tracked conv_uuid – clean up our caches so
+  // the next message in this thread starts a fresh conversation.  Let the
+  // caller perform the actual storage removal (it already has the right UUID).
+  for (int i = 0; i < s_conv_count; i++) {
+    if (uuid_equal(&s_conv_cache[i].notif_id, id)) {
+      prv_remove_conv_from_cache(id);
+      return false;
+    }
+  }
+
+  // Case 2: id is an individual message that was merged into a conversation.
+  // Delete the conversation and clean up both caches.
+  for (int i = 0; i < s_msg_map_count; i++) {
+    if (!uuid_equal(&s_msg_map[i].msg_uuid, id)) {
+      continue;
+    }
+    const Uuid conv_uuid = s_msg_map[i].conv_uuid;
+    prv_remove_conv_from_cache(&conv_uuid);
+
+    notification_storage_lock();
+    notification_storage_remove(&conv_uuid);
+    notification_storage_unlock();
+
+    Uuid conv_uuid_copy = conv_uuid;
+    notifications_handle_notification_removed(&conv_uuid_copy);
+    return true;
+  }
+
+  return false;
 }
